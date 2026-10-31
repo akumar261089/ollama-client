@@ -316,6 +316,19 @@ dialog::backdrop { background: rgba(10, 12, 16, .5); }
 .ghost-btn { padding: 9px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); }
 .ghost-btn:hover { background: var(--bg-hover); }
 
+/* Context bar */
+.ctxbar {
+  position: absolute; right: 12px; top: 64px; bottom: 118px; width: 46px; z-index: 5;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.ctx-label { font: 600 11px/1.25 var(--mono); color: var(--ink-2); text-align: center; white-space: nowrap; }
+.ctx-label small { display: block; font-weight: 400; color: var(--ink-3); font-size: 10px; }
+.ctx-track { flex: 1; width: 8px; border-radius: 99px; background: var(--bg-active); position: relative; overflow: hidden; }
+.ctx-fill { position: absolute; left: 0; right: 0; bottom: 0; height: 0; background: var(--accent); transition: height .25s ease, background .25s; }
+.ctx-track.warn .ctx-fill { background: #d99a1f; }
+.ctx-track.full .ctx-fill { background: var(--danger); }
+@media (max-width: 1200px) { .scroll { padding-right: 64px; } }
+
 .scrim { display: none; }
 
 @media (max-width: 820px) {
@@ -370,6 +383,12 @@ dialog::backdrop { background: rgba(10, 12, 16, .5); }
       <div class="title" id="chatTitle">New chat</div>
       <button class="chip" id="sessionCfg" type="button" title="Model and system prompt for this chat" hidden></button>
     </header>
+
+    <div class="ctxbar" id="ctxbar" aria-label="Estimated context usage">
+      <div class="ctx-label" id="ctxLabel"></div>
+      <div class="ctx-track" id="ctxTrack"><div class="ctx-fill" id="ctxFill"></div></div>
+      <div class="ctx-label" id="ctxPct"></div>
+    </div>
 
     <div class="scroll" id="scroll"><div class="thread" id="thread"></div></div>
 
@@ -959,6 +978,60 @@ function renderComposer() {
   btn.setAttribute('aria-label', here ? 'Stop generating' : 'Send');
   btn.disabled = here ? false : (!can || busy || !ta.value.trim());
   $('#footNote').textContent = 'Runs on your Ollama server. Chats are stored in this browser only.';
+  renderCtx();
+}
+
+/* ================= Context usage ================= */
+const DEFAULT_CTX = 4096;
+const estTokens = text => Math.ceil((text || '').length / 3.5);
+const fmtTok = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+
+function contextUsage(s) {
+  const configuredLimit = s && s.options && s.options.num_ctx;
+  const limit = Number.isFinite(configuredLimit) && configuredLimit > 0
+    ? configuredLimit : DEFAULT_CTX;
+  if (!s) return { used: 0, limit };
+
+  let base = 0, start = 0;
+  // The latest completed Ollama count includes its prompt and generated output.
+  // Thinking is excluded because this client does not resend it in chat history.
+  for (let i = s.messages.length - 1; i >= 0; i--) {
+    const m = s.messages[i];
+    if (m.role === 'assistant' && Number.isFinite(m.ctx) &&
+        !(S.stream && S.stream.msg === m)) {
+      base = Math.max(0, m.ctx - estTokens(m.thinking));
+      start = i + 1;
+      break;
+    }
+  }
+
+  let used = base;
+  if (start === 0 && (s.system || '').trim()) used += estTokens(s.system) + 4;
+  for (let i = start; i < s.messages.length; i++) {
+    const c = splitThink(s.messages[i]).content;
+    if (c) used += estTokens(c) + 4;
+  }
+
+  // Include text typed but not yet sent. It is cleared from the composer on send.
+  const pending = $('#input') ? $('#input').value : '';
+  if (pending.trim()) used += estTokens(pending) + 4;
+
+  return { used, limit };
+}
+
+function renderCtx() {
+  const { used, limit } = contextUsage(cur());
+  const pct = Math.min(100, (used / limit) * 100);
+  const fill = $('#ctxFill'), track = $('#ctxTrack');
+  if (!fill || !track) return;
+
+  fill.style.height = pct + '%';
+  track.classList.toggle('warn', pct >= 75 && pct < 90);
+  track.classList.toggle('full', pct >= 90);
+  $('#ctxLabel').innerHTML = `${fmtTok(used)}<small>/ ${fmtTok(limit)}</small>`;
+  $('#ctxPct').textContent = Math.round(pct) + '%';
+  $('#ctxbar').title =
+    `Context: ~${used.toLocaleString()} of ${limit.toLocaleString()} tokens (${Math.round(pct)}%)`;
 }
 
 function renderAll() {
@@ -1055,7 +1128,12 @@ async function streamChat(s, msg, ctrl) {
         if (j.message.thinking) msg.thinking = (msg.thinking || '') + j.message.thinking;
         scheduleLive(); saveSoon();
       }
-      if (j.done && j.eval_count && j.eval_duration) msg.stats = (j.eval_count / (j.eval_duration / 1e9)).toFixed(1) + ' tok/s';
+      if (j.done) {
+        if (j.prompt_eval_count != null || j.eval_count != null)
+          msg.ctx = (j.prompt_eval_count || 0) + (j.eval_count || 0);
+        if (j.eval_count && j.eval_duration)
+          msg.stats = (j.eval_count / (j.eval_duration / 1e9)).toFixed(1) + ' tok/s';
+      }
     }
   }
 }
@@ -1070,6 +1148,7 @@ function scheduleLive() {
     const sc = $('#scroll');
     const near = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 90;
     fillAssistant(st.node, st.msg, true, true);
+    renderCtx();
     if (near) sc.scrollTop = sc.scrollHeight;
   });
 }
@@ -1156,16 +1235,18 @@ $('#thread').addEventListener('change', e => {
   if (e.target.closest('[data-settings-prefix="setup"]')) {
     readSettingsFields($('#thread'), s, 'setup');
     updateSettingsPreview($('#thread'), 'setup', s);
+    renderCtx();
     saveSoon();
   }
 });
 $('#thread').addEventListener('input', e => {
   const s = cur();
   if (!s) return;
-  if (e.target.id === 'setupSystem') { s.system = e.target.value; saveSoon(); }
+  if (e.target.id === 'setupSystem') { s.system = e.target.value; renderCtx(); saveSoon(); }
   if (e.target.closest('[data-settings-prefix="setup"]')) {
     readSettingsFields($('#thread'), s, 'setup');
     updateSettingsPreview($('#thread'), 'setup', s);
+    renderCtx();
     saveSoon();
   }
 });
